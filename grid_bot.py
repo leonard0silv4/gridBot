@@ -58,6 +58,7 @@ if not API_KEY or not API_SECRET:
 # ─────────────────────────────────────────────
 
 USE_TESTNET = False          # ← Mude para False quando quiser operar real
+CHECK_INTERVAL = 15 
 
 # Capital por par em USDT (ajuste conforme seu saldo)
 # R$1.200 ÷ 5,70 ≈ $210  |  R$800 ÷ 5,70 ≈ $140
@@ -382,6 +383,7 @@ class GridBot:
         self.orders  : dict   = {}   # level_price → order_id
         self.active  : bool   = False
         self.pnl_usdt: float  = 0.0
+        self.total_fees  : float = 0.0  # linha nova
         self.trade_count: int = 0
 
     # ── inicialização ──────────────────────────
@@ -583,7 +585,7 @@ class GridBot:
 
     def _handle_filled(self, order: dict, level_price: float, current_price: float):
         """Processa uma ordem executada e coloca a ordem oposta."""
-        side      = order["side"]
+        side       = order["side"]
         fill_price = float(order["price"])
         qty        = float(order["executedQty"])
         levels     = self.grid["levels"]
@@ -592,40 +594,43 @@ class GridBot:
         self.trade_count += 1
 
         if side == "BUY":
-            # Comprou → coloca venda no nível acima
-            sell_price = fill_price + step
-            pnl_per_trade = (sell_price - fill_price) * qty  # estimativa
+            sell_price    = fill_price + step
+            gross         = (sell_price - fill_price) * qty
+            fee           = (fill_price * qty * FEE_RATE) + (sell_price * qty * FEE_RATE)
+            pnl_per_trade = gross - fee
+            self.pnl_usdt   += pnl_per_trade
+            self.total_fees  += fee
             log.info(
-                "✅  COMPRA executada  %s  @ %.4f  qty=%.6f  → colocando VENDA @ %.4f",
-                self.symbol, fill_price, qty, sell_price,
+                "✅  COMPRA executada  %s  @ %.4f  qty=%.6f  → colocando VENDA @ %.4f  "
+                "(lucro estimado $%.4f  taxa $%.4f)",
+                self.symbol, fill_price, qty, sell_price, pnl_per_trade, fee,
             )
             new_order = place_limit_order(
                 self.client, self.symbol, "SELL", sell_price, qty, self.sym_info
             )
         else:
-            # Vendeu → coloca compra no nível abaixo
-            buy_price = fill_price - step
-            pnl_per_trade = (fill_price - buy_price) * qty  # estimativa
+            buy_price     = fill_price - step
+            gross         = (fill_price - buy_price) * qty
+            fee           = (fill_price * qty * FEE_RATE) + (buy_price * qty * FEE_RATE)
+            pnl_per_trade = gross - fee
+            self.pnl_usdt   += pnl_per_trade
+            self.total_fees  += fee
             log.info(
-                "✅  VENDA executada   %s  @ %.4f  qty=%.6f  → colocando COMPRA @ %.4f",
-                self.symbol, fill_price, qty, buy_price,
+                "✅  VENDA executada   %s  @ %.4f  qty=%.6f  → colocando COMPRA @ %.4f  "
+                "(lucro estimado $%.4f  taxa $%.4f)",
+                self.symbol, fill_price, qty, buy_price, pnl_per_trade, fee,
             )
             new_order = place_limit_order(
                 self.client, self.symbol, "BUY", buy_price, qty, self.sym_info
             )
-            self.pnl_usdt += pnl_per_trade  # realizado após ciclo completo buy→sell
 
         if new_order:
-            # Atualiza mapa de ordens
             del self.orders[level_price]
-            new_key = round(
-                float(new_order["price"]), 8
-            )
-            self.orders[new_key] = new_order["orderId"]
+            self.orders[round(float(new_order["price"]), 8)] = new_order["orderId"]
 
         log.info(
-            "📈  PnL acumulado estimado  %s:  $%.4f  (%d trades)",
-            self.symbol, self.pnl_usdt, self.trade_count,
+            "📈  PnL líquido acumulado  %s:  $%.4f  |  taxas pagas: $%.4f  (%d trades)",
+            self.symbol, self.pnl_usdt, self.total_fees, self.trade_count,
         )
 
     # ── parada ────────────────────────────────
@@ -692,6 +697,7 @@ def send_dashboard_report(bots: list[GridBot], client, start_time: float):
             "uptime_seconds":  int(time.time() - start_time),
             "pairs":           pairs_data,
             "total_pnl_usdt":  round(sum(b.pnl_usdt for b in bots), 6),
+            "total_fees":  round(bot.total_fees, 6),  # linha nova
             "total_trades":    sum(b.trade_count for b in bots),
         }).encode("utf-8")
 
